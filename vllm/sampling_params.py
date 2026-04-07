@@ -236,6 +236,16 @@ class SamplingParams(
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    prompt_confidence_only: bool = False
+    """When True, compute only the GPU-side mean prompt confidence scalar
+    without building or returning per-token prompt logprob dictionaries.
+    ``prompt_logprobs`` is still required to control the top-k width;
+    if it is None when this flag is set, it defaults to 20."""
+    confidence_start_idx: int | None = None
+    """When set, only accumulate tokens at absolute position >= this index
+    into the ``mean_prompt_confidence`` scalar.  Positions before this are
+    skipped.  Useful for computing confidence over only the response portion
+    of a prompt.  Automatically enables ``prompt_confidence_only``."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -327,6 +337,8 @@ class SamplingParams(
         min_tokens: int = 0,
         logprobs: int | None = None,
         prompt_logprobs: int | None = None,
+        prompt_confidence_only: bool = False,
+        confidence_start_idx: int | None = None,
         detokenize: bool = True,
         skip_special_tokens: bool = True,
         spaces_between_special_tokens: bool = True,
@@ -368,6 +380,8 @@ class SamplingParams(
             min_tokens=min_tokens,
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,
+            prompt_confidence_only=prompt_confidence_only,
+            confidence_start_idx=confidence_start_idx,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
@@ -410,6 +424,20 @@ class SamplingParams(
 
         if self.prompt_logprobs is True:
             self.prompt_logprobs = 1
+
+        # When confidence_start_idx is set, auto-enable prompt_confidence_only.
+        if self.confidence_start_idx is not None:
+            if self.confidence_start_idx < 0:
+                raise ValueError(
+                    f"confidence_start_idx must be >= 0, got "
+                    f"{self.confidence_start_idx}."
+                )
+            self.prompt_confidence_only = True
+
+        # When prompt_confidence_only is requested, ensure prompt_logprobs
+        # is set so the GPU path still computes logprobs for the mean.
+        if self.prompt_confidence_only and self.prompt_logprobs is None:
+            self.prompt_logprobs = 20
 
         # Number of characters to hold back for stop string evaluation
         # until sequence is finished.

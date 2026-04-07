@@ -188,6 +188,12 @@ class ModelRunnerOutput:
         default_factory=dict
     )
 
+    # req_id -> mean prompt confidence (GPU-computed).
+    # confidence = -mean(top-k logprobs across all prompt positions).
+    mean_prompt_confidence_dict: dict[str, float] = field(
+        default_factory=dict
+    )
+
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None
 

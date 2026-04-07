@@ -360,6 +360,10 @@ class RequestState:
         else:
             prompt_logprobs = self.logprobs_processor.prompt_logprobs
 
+        mean_prompt_confidence = (
+            self.logprobs_processor.mean_prompt_confidence
+        )
+
         return RequestOutput(
             request_id=external_req_id,  # request_id is what was provided externally
             lora_request=self.lora_request,
@@ -371,6 +375,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            mean_prompt_confidence=mean_prompt_confidence,
         )
 
     def _new_completion_output(

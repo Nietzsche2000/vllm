@@ -305,6 +305,11 @@ class ModelConfig:
     handles async tokenization, chat template rendering, and multimodal
     preprocessing."""
 
+    confidence_micro_chunk: int = 131072
+    """Number of tokens to process per micro-chunk when computing
+    mean prompt confidence in confidence-only mode. Smaller values
+    reduce peak GPU memory at the cost of more kernel launches."""
+
     # Pooler config
     pooler_config: PoolerConfig | None = None
     """Pooler config which controls the behaviour of output pooling in pooling

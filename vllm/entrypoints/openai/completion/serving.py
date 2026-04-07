@@ -141,6 +141,17 @@ class OpenAIServingCompletion(OpenAIServing):
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
+        # Validate per-prompt confidence_start_idx list length.
+        if isinstance(request.confidence_start_idx, list):
+            if len(request.confidence_start_idx) != len(engine_inputs):
+                return self.create_error_response(
+                    ValueError(
+                        f"confidence_start_idx list length "
+                        f"({len(request.confidence_start_idx)}) must match "
+                        f"number of prompts ({len(engine_inputs)})"
+                    )
+                )
+
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
@@ -163,6 +174,14 @@ class OpenAIServingCompletion(OpenAIServing):
                     max_tokens,
                     self.default_sampling_params,
                 )
+
+            # Per-prompt confidence_start_idx override for batched
+            # confidence requests (list[int] gives one value per prompt).
+            if isinstance(request.confidence_start_idx, list):
+                if i < len(request.confidence_start_idx):
+                    sampling_params.confidence_start_idx = (
+                        request.confidence_start_idx[i])
+                    sampling_params.prompt_confidence_only = True
 
             request_id_item = f"{request_id}-{i}"
 
@@ -525,6 +544,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     finish_reason=output.finish_reason,
                     stop_reason=output.stop_reason,
                     prompt_logprobs=final_res.prompt_logprobs,
+                    mean_prompt_confidence=final_res.mean_prompt_confidence,
                     prompt_token_ids=(
                         prompt_token_ids if request.return_token_ids else None
                     ),

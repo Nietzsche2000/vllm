@@ -37,6 +37,9 @@ class LogprobsProcessor:
     cumulative_logprob: float | None
     num_logprobs: int | None
     num_prompt_logprobs: int | None
+    # GPU-computed mean prompt confidence:
+    # -mean(top-k logprobs across all prompt positions).
+    mean_prompt_confidence: float | None = None
 
     @classmethod
     def from_new_request(
@@ -243,3 +246,5 @@ class LogprobsProcessor:
             self._update_sample_logprobs(output.new_logprobs)
         if output.new_prompt_logprobs_tensors is not None:
             self._update_prompt_logprobs(output.new_prompt_logprobs_tensors)
+        if output.mean_prompt_confidence is not None:
+            self.mean_prompt_confidence = output.mean_prompt_confidence

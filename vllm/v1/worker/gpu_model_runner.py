@@ -594,6 +594,20 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        # When True for a request, skip tensor allocation / GPU->CPU copy /
+        # dict building and only compute the mean_prompt_confidence scalar.
+        self._prompt_confidence_only: dict[str, bool] = {}
+        # Optional per-request absolute token index from which to start
+        # accumulating into mean_prompt_confidence.  Tokens before this
+        # position are skipped.  When None, all tokens are included.
+        self._confidence_start_idx: dict[str, int] = {}
+        # Running accumulators for mean_prompt_confidence (GPU-computed).
+        # Accumulate across chunked-prefill steps and finalize on completion.
+        self._confidence_sums: dict[str, float] = {}
+        self._confidence_counts: dict[str, int] = {}
+        self._confidence_micro_chunk = (
+            self.model_config.confidence_micro_chunk
+        )
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1060,6 +1074,10 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._prompt_confidence_only.pop(req_id, None)
+            self._confidence_start_idx.pop(req_id, None)
+            self._confidence_sums.pop(req_id, None)
+            self._confidence_counts.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1165,6 +1183,12 @@ class GPUModelRunner(
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
                 )
+                if sampling_params.prompt_confidence_only:
+                    self._prompt_confidence_only[req_id] = True
+                if sampling_params.confidence_start_idx is not None:
+                    self._confidence_start_idx[req_id] = (
+                        sampling_params.confidence_start_idx
+                    )
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
@@ -3348,6 +3372,7 @@ class GPUModelRunner(
         LogprobsLists | None,
         list[list[int]],
         dict[str, LogprobsTensors | None],
+        dict[str, float],
         list[str],
         dict[str, int],
         list[int],
@@ -3447,9 +3472,11 @@ class GPUModelRunner(
             req_state.output_token_ids.extend(sampled_ids)
 
         # Compute prompt logprobs if needed.
-        prompt_logprobs_dict = self._get_prompt_logprobs_dict(
-            hidden_states[:num_scheduled_tokens],
-            scheduler_output.num_scheduled_tokens,
+        prompt_logprobs_dict, mean_prompt_confidence_dict = (
+            self._get_prompt_logprobs_dict(
+                hidden_states[:num_scheduled_tokens],
+                scheduler_output.num_scheduled_tokens,
+            )
         )
 
         return (
@@ -3457,6 +3484,7 @@ class GPUModelRunner(
             logprobs_lists,
             valid_sampled_token_ids,
             prompt_logprobs_dict,
+            mean_prompt_confidence_dict,
             req_ids_output_copy,
             req_id_to_index_output_copy,
             invalid_req_indices,
@@ -4270,6 +4298,7 @@ class GPUModelRunner(
                 logprobs_lists,
                 valid_sampled_token_ids,
                 prompt_logprobs_dict,
+                mean_prompt_confidence_dict,
                 req_ids_output_copy,
                 req_id_to_index_output_copy,
                 invalid_req_indices,
@@ -4314,6 +4343,7 @@ class GPUModelRunner(
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
+                mean_prompt_confidence_dict=mean_prompt_confidence_dict,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
@@ -4997,10 +5027,10 @@ class GPUModelRunner(
         self,
         hidden_states: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
-    ) -> dict[str, LogprobsTensors | None]:
+    ) -> tuple[dict[str, LogprobsTensors | None], dict[str, float]]:
         num_prompt_logprobs_dict = self.num_prompt_logprobs
         if not num_prompt_logprobs_dict:
-            return {}
+            return {}, {}
 
         in_progress_dict = self.input_batch.in_progress_prompt_logprobs_cpu
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
@@ -5025,15 +5055,21 @@ class GPUModelRunner(
                 self.device, non_blocking=True
             )
 
+            confidence_only = self._prompt_confidence_only.get(
+                req_id, False)
+
             # Set up target LogprobsTensors object.
-            logprobs_tensors = in_progress_dict.get(req_id)
-            if not logprobs_tensors:
-                # Create empty logprobs CPU tensors for the entire prompt.
-                # If chunked, we'll copy in slice by slice.
-                logprobs_tensors = LogprobsTensors.empty_cpu(
-                    num_prompt_tokens - 1, num_prompt_logprobs + 1
-                )
-                in_progress_dict[req_id] = logprobs_tensors
+            # Skip allocation when only the confidence scalar is needed.
+            logprobs_tensors: LogprobsTensors | None = None
+            if not confidence_only:
+                logprobs_tensors = in_progress_dict.get(req_id)
+                if not logprobs_tensors:
+                    # Create empty logprobs CPU tensors for the entire prompt.
+                    # If chunked, we'll copy in slice by slice.
+                    logprobs_tensors = LogprobsTensors.empty_cpu(
+                        num_prompt_tokens - 1, num_prompt_logprobs + 1
+                    )
+                    in_progress_dict[req_id] = logprobs_tensors
 
             # Determine number of logits to retrieve.
             start_idx = request.num_computed_tokens
@@ -5049,7 +5085,8 @@ class GPUModelRunner(
                 # This is the last chunk of prompt tokens to return.
                 num_logits = num_remaining_tokens
                 completed_prefill_reqs.append(req_id)
-                prompt_logprobs_dict[req_id] = logprobs_tensors
+                if not confidence_only:
+                    prompt_logprobs_dict[req_id] = logprobs_tensors
 
             if num_logits <= 0:
                 # This can happen for the final chunk if we prefilled exactly
@@ -5063,6 +5100,43 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
+
+            # --- Memory-optimized path for confidence-only requests ---
+            # Process tokens in micro-chunks and use in-place log_softmax
+            # to avoid materializing full [num_tokens, vocab_size] tensors.
+            if confidence_only:
+                cs_idx = self._confidence_start_idx.get(req_id, 0)
+                for mc_start in range(
+                    0, num_logits, self._confidence_micro_chunk
+                ):
+                    mc_end = min(
+                        mc_start + self._confidence_micro_chunk, num_logits
+                    )
+                    # Skip rows before confidence_start_idx.
+                    first_abs_pos = start_tok + mc_start
+                    skip_rows = max(0, cs_idx - first_abs_pos)
+                    if skip_rows >= (mc_end - mc_start):
+                        # Entire micro-chunk is before the start index.
+                        continue
+                    mc_logits = self.model.compute_logits(
+                        prompt_hidden_states[mc_start:mc_end]
+                    )
+                    mc_logits = torch.log_softmax(mc_logits, dim=-1)
+                    topk_vals, _ = torch.topk(
+                        mc_logits, num_prompt_logprobs, dim=-1
+                    )
+
+                    valid_vals = topk_vals[skip_rows:]
+                    self._confidence_sums[req_id] = (
+                        self._confidence_sums.get(req_id, 0.0)
+                        + valid_vals.sum().item()
+                    )
+                    self._confidence_counts[req_id] = (
+                        self._confidence_counts.get(req_id, 0)
+                        + valid_vals.numel()
+                    )
+                continue
+
             logits = self.model.compute_logits(prompt_hidden_states)
 
             # Get the "target" tokens for each index. For prompt at index i,
@@ -5076,7 +5150,28 @@ class GPUModelRunner(
                 logprobs, num_prompt_logprobs, tgt_token_ids
             )
 
+            # Accumulate mean_prompt_confidence on GPU before transfer.
+            # logprobs shape: [num_logits, num_prompt_logprobs + 1]
+            # Column 0 is the actual next token; columns 1: are the top-k.
+            # Use only the top-k columns to match the deduplicated dict
+            # the API returns to callers.
+            topk_logprobs = logprobs[:, 1:]
+            # Skip rows before confidence_start_idx.
+            cs_idx = self._confidence_start_idx.get(req_id, 0)
+            skip_rows = max(0, cs_idx - start_tok)
+            valid_logprobs = topk_logprobs[skip_rows:]
+            if valid_logprobs.numel() > 0:
+                self._confidence_sums[req_id] = (
+                    self._confidence_sums.get(req_id, 0.0)
+                    + valid_logprobs.sum().item()
+                )
+                self._confidence_counts[req_id] = (
+                    self._confidence_counts.get(req_id, 0)
+                    + valid_logprobs.numel()
+                )
+
             # Transfer GPU->CPU async.
+            assert logprobs_tensors is not None
             chunk_slice = slice(start_idx, start_idx + num_logits)
             logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
                 token_ids, non_blocking=True
@@ -5086,17 +5181,25 @@ class GPUModelRunner(
                 ranks, non_blocking=True
             )
 
+        # Finalize mean_prompt_confidence for completed requests.
+        mean_prompt_confidence_dict: dict[str, float] = {}
+        for req_id in completed_prefill_reqs:
+            total_sum = self._confidence_sums.pop(req_id, 0.0)
+            total_count = self._confidence_counts.pop(req_id, 0)
+            if total_count > 0:
+                mean_prompt_confidence_dict[req_id] = -(total_sum / total_count)
+
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
         for req_id in completed_prefill_reqs:
             del num_prompt_logprobs_dict[req_id]
-            del in_progress_dict[req_id]
+            in_progress_dict.pop(req_id, None)
 
         # Must synchronize the non-blocking GPU->CPU transfers.
         if prompt_logprobs_dict:
             self._sync_device()
 
-        return prompt_logprobs_dict
+        return prompt_logprobs_dict, mean_prompt_confidence_dict
 
     def _get_nans_in_logits(
         self,

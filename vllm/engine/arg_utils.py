@@ -512,6 +512,7 @@ class EngineArgs:
     )
     io_processor_plugin: str | None = None
     renderer_num_workers: int = 1
+    confidence_micro_chunk: int = ModelConfig.confidence_micro_chunk
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     video_pruning_rate: float | None = MultiModalConfig.video_pruning_rate
     mm_tensor_ipc: MMTensorIPC = MultiModalConfig.mm_tensor_ipc
@@ -790,6 +791,10 @@ class EngineArgs:
         model_group.add_argument(
             "--renderer-num-workers",
             **model_kwargs["renderer_num_workers"],
+        )
+        model_group.add_argument(
+            "--confidence-micro-chunk",
+            **model_kwargs["confidence_micro_chunk"],
         )
 
         # Model loading arguments
@@ -1475,6 +1480,7 @@ class EngineArgs:
             mm_tensor_ipc=self.mm_tensor_ipc,
             io_processor_plugin=self.io_processor_plugin,
             renderer_num_workers=self.renderer_num_workers,
+            confidence_micro_chunk=self.confidence_micro_chunk,
         )
 
     def validate_tensorizer_args(self):
